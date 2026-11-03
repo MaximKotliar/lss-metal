@@ -14,15 +14,15 @@ neural temporal upscaler) and the app that uses all three, [Lightscale](https://
 
 ## The upscalers
 
-GPU time, 1280×720 → 2560×1440, M4 Max:
+GPU time, 1280×720 → 2560×1440, M4 Max (warm GPU, median of 60 runs; it varies with GPU clocks):
 
 | Mode | What it is | GPU time |
 |---|---|---|
-| `ls1` | Lossless Scaling's LS1: a small network upscales brightness 2×, its detail is added to a bilinear enlargement; sharpness picks one of five trained weight sets (softest to sharpest) | 0.88 ms |
+| `ls1` | Lossless Scaling's LS1: a small network upscales brightness 2×, its detail is added to a bilinear enlargement; sharpness picks one of five trained weight sets (softest to sharpest) | 0.5–0.9 ms |
 | `ls1` performance | LS1's single-pass variant | 0.44 ms |
-| `fsr` | AMD FSR 1: EASU (edge-adaptive upscale), then RCAS sharpening | ~0.5 ms |
-| `bcas` | Catmull-Rom bicubic, then AMD CAS sharpening | 0.5 ms |
-| `bicubic` | Catmull-Rom bicubic | 0.3 ms |
+| `fsr` | AMD FSR 1: EASU (edge-adaptive upscale), then RCAS sharpening | 0.21 ms |
+| `bcas` | Catmull-Rom bicubic, then AMD CAS sharpening | 0.2 ms |
+| `bicubic` | Catmull-Rom bicubic | 0.1–0.3 ms |
 | `nearest` | nearest neighbour; integer scaling at whole ratios | 0.08 ms |
 
 LS1's output is any size: the network works at 2×, and its detail and the colour are resampled to the output.

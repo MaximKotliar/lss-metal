@@ -27,6 +27,9 @@ GPU time, 1280×720 → 2560×1440, M4 Max (warm GPU, median of 60 runs; it vari
 
 LS1's output is any size: the network works at 2×, and its detail and the colour are resampled to the output.
 
+Spatial upscalers need finished, anti-aliased frames. In place of a game's temporal upscaler (DLSS/MetalFX) they
+shimmer and alias: see [docs/temporal-slot.md](docs/temporal-slot.md) for the measurements.
+
 ## Setup
 
 LSSMetal uses lsfg-metal's shader translation, which needs `spirv-cross`, `spirv-tools` and, for these shaders (they

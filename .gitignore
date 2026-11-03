@@ -1,0 +1,8 @@
+.build/
+.swiftpm/
+*.png
+!docs/**/*.png
+# Lossless Scaling's shaders and anything translated from them: never commit
+*.dxbc
+*.spv
+*.metallib

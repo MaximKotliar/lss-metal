@@ -1,0 +1,107 @@
+import Foundation
+import LSFGCore
+import LSSMetal
+import Metal
+
+// C API for hosts that aren't Swift, such as a game hook (Objective-C, x86_64 under Rosetta). Built as
+// liblssbridge.dylib and dlopen()ed. Metal objects cross the boundary as unretained opaque pointers; the caller keeps
+// them alive.
+//
+//   void *lss_bridge_create(const void *device, int inW, int inH, int outW, int outH, unsigned outFormat,
+//                           int mode, float sharpness, int performance, char *error, int errorLength);
+//   int   lss_bridge_encode(void *ctx, const void *commandBuffer, const void *input, const void *output,
+//                           int outX, int outY);
+//   void  lss_bridge_destroy(void *ctx);
+//
+// mode: 1 LS1, 2 FSR, 3 BCAS, 4 bicubic, 5 nearest. sharpness 0…1 (LS1: its five weight sets). The output texture
+// needn't be shader-writable (a drawable): the upscale goes to a scratch texture of its format, then is copied.
+
+private final class Context: @unchecked Sendable {
+    let upscaler: LSSUpscaler
+    let scratch: MTLTexture
+    let outW: Int, outH: Int
+
+    init(upscaler: LSSUpscaler, scratch: MTLTexture) {
+        self.upscaler = upscaler
+        self.scratch = scratch
+        outW = scratch.width
+        outH = scratch.height
+    }
+}
+
+private func object<T>(_ p: UnsafeRawPointer, as: T.Type) -> T {
+    Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as! T
+}
+
+private func writeError(_ message: String, _ buffer: UnsafeMutablePointer<CChar>?, _ length: Int32) {
+    guard let buffer, length > 0 else { return }
+    let bytes = Array(message.utf8.prefix(Int(length) - 1))
+    for (i, b) in bytes.enumerated() { buffer[i] = CChar(bitPattern: b) }
+    buffer[bytes.count] = 0
+}
+
+/// Kernels are shared by every context on a device (loading them builds ~30 pipelines).
+nonisolated(unsafe) private var sharedKernels: (device: ObjectIdentifier, kernels: LSSKernels)?
+private let kernelsLock = NSLock()
+
+@_cdecl("lss_bridge_create")
+public func lss_bridge_create(_ device: UnsafeRawPointer, _ inW: Int32, _ inH: Int32, _ outW: Int32, _ outH: Int32,
+                              _ outFormat: UInt32, _ mode: Int32, _ sharpness: Float, _ performance: Int32,
+                              _ errorBuffer: UnsafeMutablePointer<CChar>?, _ errorLength: Int32) -> UnsafeMutableRawPointer? {
+    let dev = object(device, as: MTLDevice.self)
+    do {
+        kernelsLock.lock()
+        defer { kernelsLock.unlock() }
+        let kernels: LSSKernels
+        if let k = sharedKernels, k.device == ObjectIdentifier(dev) {
+            kernels = k.kernels
+        } else {
+            let dll = ProcessInfo.processInfo.environment["LSFG_DLL"].map { URL(fileURLWithPath: $0) }
+                ?? LosslessLocator.findAll().first?.dll
+            guard let dll else { throw LSSError.badSize("Lossless.dll not found") }
+            kernels = try LSSKernels(dll: dll, device: dev)
+            sharedKernels = (ObjectIdentifier(dev), kernels)
+        }
+        let s = max(0, min(1, sharpness))
+        let m: LSSMode = switch mode {
+        case 1: .ls1(sharpness: 1 + Int((s * 4).rounded()), performance: performance != 0)
+        case 2: .fsr(sharpness: s)
+        case 3: .bcas(sharpness: s)
+        case 4: .bicubic
+        default: .nearest
+        }
+        let up = try LSSUpscaler(kernels: kernels, mode: m, inputSize: MTLSize(width: Int(inW), height: Int(inH), depth: 1),
+                                 outputSize: MTLSize(width: Int(outW), height: Int(outH), depth: 1))
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: MTLPixelFormat(rawValue: UInt(outFormat)) ?? .bgra8Unorm,
+                                                         width: Int(outW), height: Int(outH), mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]
+        d.storageMode = .private
+        guard let scratch = dev.makeTexture(descriptor: d) else { throw LSSError.badSize("cannot make a \(outW)x\(outH) texture") }
+        return Unmanaged.passRetained(Context(upscaler: up, scratch: scratch)).toOpaque()
+    } catch {
+        writeError("\(error)", errorBuffer, errorLength)
+        return nil
+    }
+}
+
+/// Encodes the upscale of `input` (whole texture) into `output` at (outX, outY). Returns 1 on success.
+@_cdecl("lss_bridge_encode")
+public func lss_bridge_encode(_ ctx: UnsafeMutableRawPointer, _ commandBuffer: UnsafeRawPointer, _ input: UnsafeRawPointer,
+                              _ output: UnsafeRawPointer, _ outX: Int32, _ outY: Int32) -> Int32 {
+    let c = Unmanaged<Context>.fromOpaque(ctx).takeUnretainedValue()
+    let cb = object(commandBuffer, as: MTLCommandBuffer.self)
+    let src = object(input, as: MTLTexture.self)
+    let dst = object(output, as: MTLTexture.self)
+    guard Int(outX) + c.outW <= dst.width, Int(outY) + c.outH <= dst.height, dst.pixelFormat == c.scratch.pixelFormat else { return 0 }
+    c.upscaler.encode(commandBuffer: cb, input: src, output: c.scratch)
+    guard let blit = cb.makeBlitCommandEncoder() else { return 0 }
+    blit.copy(from: c.scratch, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(), sourceSize: MTLSize(width: c.outW, height: c.outH, depth: 1),
+              to: dst, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: Int(outX), y: Int(outY), z: 0))
+    blit.endEncoding()
+    return 1
+}
+
+@_cdecl("lss_bridge_destroy")
+public func lss_bridge_destroy(_ ctx: UnsafeMutableRawPointer) {
+    Unmanaged<Context>.fromOpaque(ctx).release()
+}

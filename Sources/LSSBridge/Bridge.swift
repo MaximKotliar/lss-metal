@@ -13,19 +13,33 @@ import Metal
 //                           int outX, int outY);
 //   void  lss_bridge_destroy(void *ctx);
 //
-// mode: 1 LS1, 2 FSR, 3 BCAS, 4 bicubic, 5 nearest. sharpness 0…1 (LS1: its five weight sets). The output texture
-// needn't be shader-writable (a drawable): the upscale goes to a scratch texture of its format, then is copied.
+// mode: 1 LS1, 2 FSR, 3 BCAS, 4 bicubic, 5 nearest. sharpness 0…1 (LS1: its five weight sets). The upscale is
+// written straight into the output when it's shader-writable (a drawable of a layer with framebufferOnly off);
+// otherwise it goes to a scratch texture of the output's format and is copied.
 
 private final class Context: @unchecked Sendable {
     let upscaler: LSSUpscaler
-    let scratch: MTLTexture
+    let device: MTLDevice
+    let format: MTLPixelFormat
     let outW: Int, outH: Int
+    /// Made on the first output that isn't shader-writable.
+    var scratch: MTLTexture?
 
-    init(upscaler: LSSUpscaler, scratch: MTLTexture) {
+    init(upscaler: LSSUpscaler, device: MTLDevice, format: MTLPixelFormat, outW: Int, outH: Int) {
         self.upscaler = upscaler
-        self.scratch = scratch
-        outW = scratch.width
-        outH = scratch.height
+        self.device = device
+        self.format = format
+        self.outW = outW
+        self.outH = outH
+    }
+
+    func scratchTexture() -> MTLTexture? {
+        if let scratch { return scratch }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: outW, height: outH, mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]
+        d.storageMode = .private
+        scratch = device.makeTexture(descriptor: d)
+        return scratch
     }
 }
 
@@ -72,12 +86,8 @@ public func lss_bridge_create(_ device: UnsafeRawPointer, _ inW: Int32, _ inH: I
         }
         let up = try LSSUpscaler(kernels: kernels, mode: m, inputSize: MTLSize(width: Int(inW), height: Int(inH), depth: 1),
                                  outputSize: MTLSize(width: Int(outW), height: Int(outH), depth: 1))
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: MTLPixelFormat(rawValue: UInt(outFormat)) ?? .bgra8Unorm,
-                                                         width: Int(outW), height: Int(outH), mipmapped: false)
-        d.usage = [.shaderRead, .shaderWrite]
-        d.storageMode = .private
-        guard let scratch = dev.makeTexture(descriptor: d) else { throw LSSError.badSize("cannot make a \(outW)x\(outH) texture") }
-        return Unmanaged.passRetained(Context(upscaler: up, scratch: scratch)).toOpaque()
+        let format = MTLPixelFormat(rawValue: UInt(outFormat)) ?? .bgra8Unorm
+        return Unmanaged.passRetained(Context(upscaler: up, device: dev, format: format, outW: Int(outW), outH: Int(outH))).toOpaque()
     } catch {
         writeError("\(error)", errorBuffer, errorLength)
         return nil
@@ -92,10 +102,15 @@ public func lss_bridge_encode(_ ctx: UnsafeMutableRawPointer, _ commandBuffer: U
     let cb = object(commandBuffer, as: MTLCommandBuffer.self)
     let src = object(input, as: MTLTexture.self)
     let dst = object(output, as: MTLTexture.self)
-    guard Int(outX) + c.outW <= dst.width, Int(outY) + c.outH <= dst.height, dst.pixelFormat == c.scratch.pixelFormat else { return 0 }
-    c.upscaler.encode(commandBuffer: cb, input: src, output: c.scratch)
+    guard Int(outX) + c.outW <= dst.width, Int(outY) + c.outH <= dst.height, dst.pixelFormat == c.format else { return 0 }
+    if dst.usage.contains(.shaderWrite) {
+        c.upscaler.encode(commandBuffer: cb, input: src, output: dst, outputOrigin: MTLOrigin(x: Int(outX), y: Int(outY), z: 0))
+        return 1
+    }
+    guard let scratch = c.scratchTexture() else { return 0 }
+    c.upscaler.encode(commandBuffer: cb, input: src, output: scratch)
     guard let blit = cb.makeBlitCommandEncoder() else { return 0 }
-    blit.copy(from: c.scratch, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(), sourceSize: MTLSize(width: c.outW, height: c.outH, depth: 1),
+    blit.copy(from: scratch, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(), sourceSize: MTLSize(width: c.outW, height: c.outH, depth: 1),
               to: dst, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: Int(outX), y: Int(outY), z: 0))
     blit.endEncoding()
     return 1

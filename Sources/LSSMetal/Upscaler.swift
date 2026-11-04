@@ -70,7 +70,10 @@ public final class LSSUpscaler: @unchecked Sendable {
             intermediates.append(texture(2 * w, 2 * h, .r16Float))   // brightness detail at 2x
         case .fsr, .bcas:
             intermediates = [texture(outputSize.width, outputSize.height, .rgba16Float)]
-        case .bicubic, .nearest:
+        case .bicubic:
+            // its shader writes at the output's top left: with an output origin it goes here first (made then)
+            break
+        case .nearest:
             break
         }
     }
@@ -112,8 +115,9 @@ public final class LSSUpscaler: @unchecked Sendable {
         case let .ls1(sharpness, performance):
             let set = max(1, min(5, sharpness)) - 1
             let detail = intermediates.last!
-            // the network leaves a 2-pixel border unwritten: there the detail must be zero (plain bilinear)
-            clear(detail, enc: enc)
+            // the network leaves a 2-pixel border unwritten: there the detail must be zero (plain bilinear). Nothing
+            // else ever writes it, so one clear lasts.
+            if !detailCleared { clear(detail, enc: enc); detailCleared = true }
             let inGrid = MTLSize(width: Int(iw), height: Int(ih), depth: 1)
             if performance {
                 run(Self.ls1Performance[set], consts: full, textures: ["t0": input, "u0": detail], grid: inGrid)
@@ -156,12 +160,31 @@ public final class LSSUpscaler: @unchecked Sendable {
             enc.dispatchThreadgroups(groups, threadsPerThreadgroup: k.threadgroupSize)
 
         case .bicubic:
-            run(Self.bicubicID, consts: full, cbName: "cb1", textures: ["t0": input, "u0": output],
-                grid: MTLSize(width: Int(ow), height: Int(oh), depth: 1))
+            let grid = MTLSize(width: Int(ow), height: Int(oh), depth: 1)
+            if outputOrigin.x == 0, outputOrigin.y == 0 {
+                run(Self.bicubicID, consts: full, cbName: "cb1", textures: ["t0": input, "u0": output], grid: grid)
+            } else {
+                // the shader ignores the output origin: upscale to a texture of the output's size, then copy it 1:1
+                if intermediates.first?.pixelFormat != output.pixelFormat {   // the output's format: same rounding
+                    let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: output.pixelFormat, width: Int(ow), height: Int(oh), mipmapped: false)
+                    d.usage = [.shaderRead, .shaderWrite]
+                    d.storageMode = .private
+                    intermediates = [kernels.device.makeTexture(descriptor: d)!]
+                }
+                run(Self.bicubicID, consts: full, cbName: "cb1", textures: ["t0": input, "u0": intermediates[0]], grid: grid)
+                var a: [UInt32] = [0, 0, ow, oh, UInt32(outputOrigin.x), UInt32(outputOrigin.y), ow, oh]
+                enc.setComputePipelineState(nearest)
+                enc.setBytes(&a, length: a.count * 4, index: 0)
+                enc.setTexture(intermediates[0], index: 0)
+                enc.setTexture(output, index: 1)
+                enc.dispatchThreads(grid, threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+            }
 
         case let .bcas(sharpness):
             let mid = intermediates[0]
-            run(Self.bicubicID, consts: full, cbName: "cb1", textures: ["t0": input, "u0": mid],
+            var toMid = full   // the intermediate starts at 0, not at the output's origin
+            toMid.outX = 0; toMid.outY = 0
+            run(Self.bicubicID, consts: toMid, cbName: "cb1", textures: ["t0": input, "u0": mid],
                 grid: MTLSize(width: Int(ow), height: Int(oh), depth: 1))
             // CAS: const1.x = the negative peak, -1 / lerp(8, 5, sharpness) (AMD's CasSetup)
             let s = max(0, min(1, sharpness))
@@ -221,4 +244,5 @@ public final class LSSUpscaler: @unchecked Sendable {
         enc.dispatchThreads(MTLSize(width: t.width, height: t.height, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
     }
     private var zero: MTLTexture?
+    private var detailCleared = false
 }

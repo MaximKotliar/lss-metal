@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import NISMetal
 
 /// Which of Lossless Scaling's upscalers to run.
 public enum LSSMode: Sendable, Equatable, Hashable {
@@ -16,7 +17,7 @@ public enum LSSMode: Sendable, Equatable, Hashable {
     /// Nearest neighbour (integer scaling at integer ratios). Not from the DLL.
     case nearest
     /// NVIDIA Image Scaling: edge-adaptive upscale with sharpening, `sharpness` 0 … 1 (0.5: NVIDIA's default). Not
-    /// from the DLL (NVIDIA's MIT source, see NIS.swift), so it needs no Lossless Scaling.
+    /// from the DLL: nis-metal (NVIDIA's MIT source), so it needs no Lossless Scaling.
     case nis(sharpness: Float)
 
     /// Whether it runs Lossless Scaling's shaders (so needs `LSSKernels` from a Lossless.dll).

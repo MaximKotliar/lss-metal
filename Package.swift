@@ -14,9 +14,12 @@ let package = Package(
     dependencies: [
         // Finds Lossless.dll and translates its shaders (the same cache LSFG uses).
         .package(url: "https://github.com/MaximKotliar/lsfg-metal.git", branch: "main"),
+        // NVIDIA Image Scaling, the one upscaler here that isn't Lossless Scaling's.
+        .package(url: "https://github.com/MaximKotliar/nis-metal.git", branch: "main"),
     ],
     targets: [
-        .target(name: "LSSMetal", dependencies: [.product(name: "LSFGCore", package: "lsfg-metal")]),
+        .target(name: "LSSMetal", dependencies: [.product(name: "LSFGCore", package: "lsfg-metal"),
+                                               .product(name: "NISMetal", package: "nis-metal")]),
         .target(name: "LSSBridge", dependencies: ["LSSMetal", .product(name: "LSFGCore", package: "lsfg-metal")]),
         .executableTarget(name: "lss-metal", dependencies: ["LSSMetal", .product(name: "LSFGCore", package: "lsfg-metal")],
                           swiftSettings: [.swiftLanguageMode(.v5)]),   // a plain script-style tool

@@ -1,5 +1,5 @@
 {
-  "originHash" : "3d9085b93cc6b5c09b569d3a9ecfe617d4b528e9af94e33127cce8da289964b2",
+  "originHash" : "dbe40c83f1a5817ddeb822fdf12093dd122b36bb8816df4311862a6619a22843",
   "pins" : [
     {
       "identity" : "lsfg-metal",
@@ -8,6 +8,15 @@
       "state" : {
         "branch" : "main",
         "revision" : "877c5962e0d134d75f26ff5bb615d40980300d26"
+      }
+    },
+    {
+      "identity" : "nis-metal",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/MaximKotliar/nis-metal.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "07c74d0c429f6f998e7d590786add89d640b9274"
       }
     }
   ],

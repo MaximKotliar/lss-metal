@@ -95,9 +95,13 @@ public func lss_bridge_create(_ device: UnsafeRawPointer, _ inW: Int32, _ inH: I
             // fall back to kernels translated on this Mac (developer setups).
             let baked = ownDirectory().appending(path: "baked")
             let loaded: LSSKernels
-            if FileManager.default.fileExists(atPath: baked.appending(path: LSFGKernels.dxbcManifestName).path),
-               let prebuilt = try? LSSKernels(bakedDirectory: baked, dll: dll, device: dev) {
-                loaded = prebuilt
+            if FileManager.default.fileExists(atPath: baked.appending(path: LSFGKernels.dxbcManifestName).path) {
+                do { loaded = try LSSKernels(bakedDirectory: baked, dll: dll, device: dev) }
+                catch let bakedError {
+                    // If translating here fails too, say why the pre-baked ones didn't load: that's the one to read.
+                    do { loaded = try LSSKernels(dll: dll, device: dev) }
+                    catch { throw LSSError.badSize("pre-baked kernels didn't load (\(bakedError)); translating them here failed too (\(error))") }
+                }
             } else {
                 loaded = try LSSKernels(dll: dll, device: dev)
             }

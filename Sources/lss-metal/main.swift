@@ -7,6 +7,7 @@ let usage = """
 usage: lss-metal <command>
   upscale IN.png -o OUT.png [--mode ls1|ls1-perf|fsr|bcas|bicubic|nearest] [--sharpness N] [--scale F | --size WxH] [--runs N]
   eval IN.png [--scale F] [--out DIR]   shrink IN by F (default 2), upscale it back with every mode, score against IN
+  check-baked DIR IN.png   every mode with the baked kernels in DIR vs the translated ones: identical output?
 
 The shaders come from your own Lossless.dll (Steam install inside a CrossOver bottle, or LSFG_DLL), translated by
 lsfg-metal's scripts/translate-shaders.sh with DXBC_COMPILER set.
@@ -48,7 +49,7 @@ func texture(_ w: Int, _ h: Int, write: Bool) -> MTLTexture {
 }
 
 /// Upscales `img` to w x h; returns the result and the median GPU time of `runs` runs.
-func upscale(_ img: FrameIO.Image, mode: LSSMode, w: Int, h: Int, runs: Int = 1) throws -> (FrameIO.Image, Double) {
+func upscale(_ img: FrameIO.Image, mode: LSSMode, w: Int, h: Int, runs: Int = 1, with kernels: LSSKernels = kernels) throws -> (FrameIO.Image, Double) {
     let src = texture(img.width, img.height, write: false)
     FrameIO.upload(img, to: src)
     let dst = texture(w, h, write: true)
@@ -88,6 +89,25 @@ do {
         let (res, ms) = try upscale(img, mode: mode, w: w, h: h, runs: Int(option("--runs") ?? "") ?? 1)
         try FrameIO.save(res, to: URL(fileURLWithPath: out))
         print("\(mode) \(img.width)x\(img.height) -> \(w)x\(h): GPU \(String(format: "%.3f", ms)) ms, wrote \(out)")
+    case "check-baked":
+        guard args.count >= 2 else { fail(usage) }
+        let baked = try LSSKernels(bakedDirectory: URL(fileURLWithPath: args[0]), dll: dll, device: device)
+        let img = try FrameIO.load(URL(fileURLWithPath: args[1]))
+        var modes: [(String, LSSMode)] = [("nearest", .nearest), ("bicubic", .bicubic), ("bcas", .bcas(sharpness: 0.5)),
+                                          ("fsr", .fsr(sharpness: 0.8))]
+        for s in 1...5 { modes.append(("ls1-\(s)", .ls1(sharpness: s, performance: false))) }
+        for s in 1...5 { modes.append(("ls1-perf-\(s)", .ls1(sharpness: s, performance: true))) }
+        var same = true
+        for (name, mode) in modes {
+            let (a, ta) = try upscale(img, mode: mode, w: img.width * 2, h: img.height * 2, runs: 30)
+            let (b, tb) = try upscale(img, mode: mode, w: img.width * 2, h: img.height * 2, runs: 30, with: baked)
+            let diff = zip(a.rgba, b.rgba).count { $0 != $1 }
+            let worst = zip(a.rgba, b.rgba).map { abs(Int($0) - Int($1)) }.max() ?? 0
+            same = same && diff == 0
+            print(String(format: "  %-12@ differing bytes %d (at most %d/255)   translated %.3f ms   baked %.3f ms", name as NSString, diff, worst, ta, tb))
+        }
+        print(same ? "PASS: baked kernels give identical output" : "FAIL")
+        if !same { exit(1) }
     case "eval":
         guard args.count >= 1 else { fail(usage) }
         let truth = try FrameIO.load(URL(fileURLWithPath: args[0]))

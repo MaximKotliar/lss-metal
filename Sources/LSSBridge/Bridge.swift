@@ -47,6 +47,12 @@ private func object<T>(_ p: UnsafeRawPointer, as: T.Type) -> T {
     Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as! T
 }
 
+private func ownDirectory() -> URL {
+    var info = Dl_info()
+    guard dladdr(#dsohandle, &info) != 0, let path = info.dli_fname else { return URL(fileURLWithPath: ".") }
+    return URL(fileURLWithPath: String(cString: path)).deletingLastPathComponent()
+}
+
 private func writeError(_ message: String, _ buffer: UnsafeMutablePointer<CChar>?, _ length: Int32) {
     guard let buffer, length > 0 else { return }
     let bytes = Array(message.utf8.prefix(Int(length) - 1))
@@ -73,7 +79,15 @@ public func lss_bridge_create(_ device: UnsafeRawPointer, _ inW: Int32, _ inH: I
             let dll = ProcessInfo.processInfo.environment["LSFG_DLL"].map { URL(fileURLWithPath: $0) }
                 ?? LosslessLocator.findAll().first?.dll
             guard let dll else { throw LSSError.badSize("Lossless.dll not found") }
-            kernels = try LSSKernels(dll: dll, device: dev)
+            // Prefer the pre-baked kernels shipped next to this library (numbers from the DLL, no tools needed);
+            // fall back to kernels translated on this Mac (developer setups).
+            let baked = ownDirectory().appending(path: "baked")
+            if FileManager.default.fileExists(atPath: baked.appending(path: LSFGKernels.dxbcManifestName).path),
+               let prebuilt = try? LSSKernels(bakedDirectory: baked, dll: dll, device: dev) {
+                kernels = prebuilt
+            } else {
+                kernels = try LSSKernels(dll: dll, device: dev)
+            }
             sharedKernels = (ObjectIdentifier(dev), kernels)
         }
         let s = max(0, min(1, sharpness))

@@ -54,6 +54,40 @@ public final class LSSKernels: @unchecked Sendable {
         try self.init(cacheDirectory: LSFGKernels.cacheDirectory(forDLL: dll), device: device)
     }
 
+    /// Kernels from a pre-baked library (lsfg-metal's `bake --dxbc-compiler … --dxbc-ids …`: no weights inside),
+    /// specialized with the weights and other numbers read from the user's own Lossless.dll. Needs no tools.
+    /// Throws if a shader in this DLL doesn't have the baked structure (a Lossless Scaling update changed it).
+    public init(bakedDirectory: URL, dll: URL, device: MTLDevice) throws {
+        self.device = device
+        let manifest = try JSONDecoder().decode(BakedManifest.self,
+                                                from: Data(contentsOf: bakedDirectory.appending(path: LSFGKernels.dxbcManifestName)))
+        let library = try device.makeLibrary(URL: bakedDirectory.appending(path: LSFGKernels.dxbcSkeletonLibraryName))
+        let shaders = Dictionary(uniqueKeysWithValues: try LSFGShaderLibrary(dll: dll).entries.map { ($0.resourceID, $0.shader.bytes) })
+        var kernels: [UInt32: Kernel] = [:]
+        for id in Self.ids {
+            guard let entry = manifest.kernels[String(id)], let dxbc = shaders[id], entry.group.count == 3 else {
+                throw LSSError.missingKernel(id)
+            }
+            let values = MTLFunctionConstantValues()
+            for (k, c) in try DXBCConstants.constants(dxbc, entry: entry).enumerated() {
+                switch c.kind {
+                case .half: var bits = UInt16(c.bits); values.setConstantValue(&bits, type: .half, index: k)
+                case .float: var bits = c.bits; values.setConstantValue(&bits, type: .float, index: k)
+                }
+            }
+            let fn = try library.makeFunction(name: "lsfg_\(id)", constantValues: values)
+            var reflection: MTLComputePipelineReflection?
+            let pipeline = try device.makeComputePipelineState(function: fn, options: [.bindingInfo], reflection: &reflection)
+            var bindings: [String: Int] = [:]
+            for b in reflection?.bindings ?? [] { bindings[b.name] = b.index }
+            kernels[id] = Kernel(id: id, pipeline: pipeline,
+                                 threadgroupSize: MTLSize(width: entry.group[0], height: entry.group[1], depth: entry.group[2]),
+                                 bindings: bindings)
+        }
+        self.kernels = kernels
+        own = try device.makeLibrary(source: Self.ownSource, options: nil)
+    }
+
     public subscript(id: UInt32) -> Kernel { kernels[id]! }
 
     static let ownSource = """

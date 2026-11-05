@@ -1,5 +1,5 @@
 {
-  "originHash" : "c29f18046586a0e68143f1e380a377f33af9ae82428a8f0b3c2c87deaf904f7d",
+  "originHash" : "3d9085b93cc6b5c09b569d3a9ecfe617d4b528e9af94e33127cce8da289964b2",
   "pins" : [
     {
       "identity" : "lsfg-metal",
@@ -7,7 +7,7 @@
       "location" : "https://github.com/MaximKotliar/lsfg-metal.git",
       "state" : {
         "branch" : "main",
-        "revision" : "29baa5024e4024ad9c19b117d53f5ee447b05b94"
+        "revision" : "877c5962e0d134d75f26ff5bb615d40980300d26"
       }
     }
   ],

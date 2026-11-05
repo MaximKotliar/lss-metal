@@ -90,6 +90,18 @@ public final class LSSKernels: @unchecked Sendable {
 
     public subscript(id: UInt32) -> Kernel { kernels[id]! }
 
+    /// The nearest-neighbour pipeline (our own kernel, no DLL needed), one per device.
+    nonisolated(unsafe) private static var nearestCache: [UInt64: MTLComputePipelineState] = [:]
+    private static let nearestLock = NSLock()
+    static func nearestPipeline(device: MTLDevice) throws -> MTLComputePipelineState {
+        nearestLock.lock(); defer { nearestLock.unlock() }
+        if let p = nearestCache[device.registryID] { return p }
+        let lib = try device.makeLibrary(source: ownSource, options: nil)
+        let p = try device.makeComputePipelineState(function: lib.makeFunction(name: "lss_nearest")!)
+        nearestCache[device.registryID] = p
+        return p
+    }
+
     static let ownSource = """
     #include <metal_stdlib>
     using namespace metal;
@@ -107,11 +119,13 @@ public final class LSSKernels: @unchecked Sendable {
 public enum LSSError: Error, CustomStringConvertible {
     case missingKernel(UInt32)
     case badSize(String)
+    case needsLosslessScaling
 
     public var description: String {
         switch self {
         case let .missingKernel(id): "Lossless Scaling shader \(id) is missing from the translated library (run lsfg-metal's scripts/translate-shaders.sh with DXBC_COMPILER set)"
         case let .badSize(what): what
+        case .needsLosslessScaling: "this upscaler is Lossless Scaling's: it needs Lossless.dll"
         }
     }
 }

@@ -13,7 +13,8 @@ import Metal
 //                           int outX, int outY);
 //   void  lss_bridge_destroy(void *ctx);
 //
-// mode: 1 LS1, 2 FSR, 3 BCAS, 4 bicubic, 5 nearest. sharpness 0…1 (LS1: its five weight sets). The upscale is
+// mode: 1 LS1, 2 FSR, 3 BCAS, 4 bicubic, 5 nearest, 6 NIS. sharpness 0…1 (LS1: its five weight sets). NIS and nearest
+// need no Lossless.dll. The upscale is
 // written straight into the output when it's shader-writable (a drawable of a layer with framebufferOnly off);
 // otherwise it goes to a scratch texture of the output's format and is copied.
 
@@ -70,10 +71,21 @@ public func lss_bridge_create(_ device: UnsafeRawPointer, _ inW: Int32, _ inH: I
                               _ errorBuffer: UnsafeMutablePointer<CChar>?, _ errorLength: Int32) -> UnsafeMutableRawPointer? {
     let dev = object(device, as: MTLDevice.self)
     do {
+        let s = max(0, min(1, sharpness))
+        let m: LSSMode = switch mode {
+        case 1: .ls1(sharpness: 1 + Int((s * 4).rounded()), performance: performance != 0)
+        case 2: .fsr(sharpness: s)
+        case 3: .bcas(sharpness: s)
+        case 4: .bicubic
+        case 6: .nis(sharpness: s)
+        default: .nearest
+        }
         kernelsLock.lock()
         defer { kernelsLock.unlock() }
-        let kernels: LSSKernels
-        if let k = sharedKernels, k.device == ObjectIdentifier(dev) {
+        let kernels: LSSKernels?
+        if !m.needsLosslessScaling {
+            kernels = nil
+        } else if let k = sharedKernels, k.device == ObjectIdentifier(dev) {
             kernels = k.kernels
         } else {
             let dll = ProcessInfo.processInfo.environment["LSFG_DLL"].map { URL(fileURLWithPath: $0) }
@@ -82,23 +94,17 @@ public func lss_bridge_create(_ device: UnsafeRawPointer, _ inW: Int32, _ inH: I
             // Prefer the pre-baked kernels shipped next to this library (numbers from the DLL, no tools needed);
             // fall back to kernels translated on this Mac (developer setups).
             let baked = ownDirectory().appending(path: "baked")
+            let loaded: LSSKernels
             if FileManager.default.fileExists(atPath: baked.appending(path: LSFGKernels.dxbcManifestName).path),
                let prebuilt = try? LSSKernels(bakedDirectory: baked, dll: dll, device: dev) {
-                kernels = prebuilt
+                loaded = prebuilt
             } else {
-                kernels = try LSSKernels(dll: dll, device: dev)
+                loaded = try LSSKernels(dll: dll, device: dev)
             }
-            sharedKernels = (ObjectIdentifier(dev), kernels)
+            sharedKernels = (ObjectIdentifier(dev), loaded)
+            kernels = loaded
         }
-        let s = max(0, min(1, sharpness))
-        let m: LSSMode = switch mode {
-        case 1: .ls1(sharpness: 1 + Int((s * 4).rounded()), performance: performance != 0)
-        case 2: .fsr(sharpness: s)
-        case 3: .bcas(sharpness: s)
-        case 4: .bicubic
-        default: .nearest
-        }
-        let up = try LSSUpscaler(kernels: kernels, mode: m, inputSize: MTLSize(width: Int(inW), height: Int(inH), depth: 1),
+        let up = try LSSUpscaler(kernels: kernels, device: dev, mode: m, inputSize: MTLSize(width: Int(inW), height: Int(inH), depth: 1),
                                  outputSize: MTLSize(width: Int(outW), height: Int(outH), depth: 1))
         let format = MTLPixelFormat(rawValue: UInt(outFormat)) ?? .bgra8Unorm
         return Unmanaged.passRetained(Context(upscaler: up, device: dev, format: format, outW: Int(outW), outH: Int(outH))).toOpaque()

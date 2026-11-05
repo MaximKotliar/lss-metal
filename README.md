@@ -1,12 +1,14 @@
 # LSSMetal
 
-Lossless Scaling's **spatial upscalers** on Metal, for developers: LS1 (Lossless Scaling's own trained upscaler),
-AMD FSR 1, BCAS (bicubic + AMD CAS), bicubic, and nearest neighbour, as a Swift library, a C API and a command-line
-tool. They upscale a finished frame on its own (no depth, motion or history), so they work for any game or video.
+**Spatial upscalers** on Metal, for developers: Lossless Scaling's LS1 (its own trained upscaler), AMD FSR 1, BCAS
+(bicubic + AMD CAS) and bicubic, plus NVIDIA Image Scaling and nearest neighbour, as a Swift library, a C API and a
+command-line tool. They upscale a finished frame on its own (no depth, motion or history), so they work for any game
+or video.
 
-Only for people who own [Lossless Scaling on Steam](https://store.steampowered.com/app/993090/). The shaders, including
-LS1's trained weights, are read from the user's own `Lossless.dll` and translated on their Mac. This repository
-contains no DLL, no shaders and nothing translated from them. Nearest neighbour is our own small kernel.
+Lossless Scaling's upscalers are only for people who own [Lossless Scaling on Steam](https://store.steampowered.com/app/993090/).
+Their shaders, including LS1's trained weights, are read from the user's own `Lossless.dll` and translated on their
+Mac. This repository contains no DLL, no shaders and nothing translated from them. NIS and nearest neighbour need no
+Lossless Scaling: NIS is ported from NVIDIA's MIT-licensed source, nearest is our own small kernel.
 
 Part of a set: [lsfg-metal](https://github.com/MaximKotliar/lsfg-metal) (Lossless Scaling's frame generation; this
 package uses its DLL locator and shader translation), [nss-metal](https://github.com/MaximKotliar/nss-metal) (Arm's
@@ -23,9 +25,33 @@ GPU time, 1280×720 → 2560×1440, M4 Max (warm GPU, median of 60 runs; it vari
 | `fsr` | AMD FSR 1: EASU (edge-adaptive upscale), then RCAS sharpening | 0.21 ms |
 | `bcas` | Catmull-Rom bicubic, then AMD CAS sharpening | 0.2 ms |
 | `bicubic` | Catmull-Rom bicubic | 0.1–0.3 ms |
+| `nis` | NVIDIA Image Scaling: a 6-tap polyphase scaler blended with four directional filters by an edge map, with unsharp masking; sharpness 0 (none) … 1 | 0.18 ms |
 | `nearest` | nearest neighbour; integer scaling at whole ratios | 0.08 ms |
 
 LS1's output is any size: the network works at 2×, and its detail and the colour are resampled to the output.
+
+### NIS
+
+[NVIDIA Image Scaling](https://github.com/NVIDIAGameWorks/NVIDIAImageScaling) 1.0.3, ported by hand from NVIDIA's
+`NIS_Scaler.h` and `NIS_Config.h` (MIT) to Metal ([NIS.swift](Sources/LSSMetal/NIS.swift)). The algorithm is
+NVIDIA's step for step; the Apple-specific parts:
+
+- **NVIDIA's fp16 build:** the brightness tile, edge map and coefficients are half precision in threadgroup memory,
+  the maths is float. Half the threadgroup memory of the float build means twice as many blocks at once:
+  0.31 against 0.52 ms at 1728×1117 → 3456×2234 (M4 Max). Half-precision maths would save another ~10% but flips
+  edge decisions (single pixels off by up to 38/255) and loses precision in linear HDR, so it's off.
+- **Gathers:** the source is read with three texture gathers per 2×2 instead of four filtered samples.
+- **No coefficient textures:** NVIDIA's two 64-phase tables are compiled into the shader.
+- **HDR:** NVIDIA's linear and PQ modes are compile-time options.
+
+`lss-metal nis-check DIR IN.png` compares it with NVIDIA's own compiled shader (Lossless Scaling ships it as DXBC
+243/244; translate those with dxbc-spirv and spirv-cross into DIR). The float build matches to 71.7 dB, at most 2/255
+apart; the default fp16 build to 61.9 dB, as NVIDIA's own fp16 build differs from its float one. (Within 4 pixels of
+the border the translated reference itself is unreliable: NVIDIA's bounds check turns a negative coordinate into an
+unsigned integer, which Direct3D clamps to 0 and Metal doesn't.) `lss-metal nis-bench IN.png` times the block-size and
+precision variants.
+
+NVIDIA rates NIS for 1×–2×; larger steps work too, downscaling doesn't.
 
 Spatial upscalers need finished, anti-aliased frames. In place of a game's temporal upscaler (DLSS/MetalFX) they
 shimmer and alias: see [docs/temporal-slot.md](docs/temporal-slot.md) for the measurements.
@@ -83,11 +109,13 @@ swift run -c release lss-metal eval frame.png --out results/   # shrink 2x, upsc
 
 The DLL holds 202 DXBC compute shaders besides LSFG 3.1's SPIR-V. Their resource and constant names identify the
 families: LS1 (IDs 141–161: five three-pass weight sets, 147–161, five single-pass ones, 141–145, and the colour
-combine, 146), FSR 1 (EASU 137–140, RCAS 247–248), CAS (134), bicubic (133, 135), NVIDIA NIS (243–246), Anime4K-style
-CNNs (101–132) and older LSFG versions. The shared 48-byte constant block is (input region size, input texture size),
-(input origin, HDR flag), (output size, output origin). NIS and the Anime4K-style modes aren't wired up yet.
+combine, 146), FSR 1 (EASU 137–140, RCAS 247–248), CAS (134), bicubic (133, 135), NVIDIA NIS (243–246: stock NVIDIA,
+SDR and linear HDR, 256 and 128 threads), Anime4K-style CNNs (101–132) and older LSFG versions. The shared 48-byte
+constant block is (input region size, input texture size), (input origin, HDR flag), (output size, output origin).
+NIS runs from NVIDIA's source instead (see above); the Anime4K-style modes aren't wired up.
 
 ## License
 
 MIT (see [LICENSE](LICENSE)). Lossless Scaling, its DLL and its shaders are not covered: they're the user's own
-licensed copy, read at run time.
+licensed copy, read at run time. The NIS port is derived from NVIDIA Image Scaling, MIT, Copyright (c) 2022 NVIDIA
+CORPORATION & AFFILIATES; its notice is kept in [NIS.swift](Sources/LSSMetal/NIS.swift).

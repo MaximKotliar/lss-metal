@@ -15,6 +15,17 @@ public enum LSSMode: Sendable, Equatable, Hashable {
     case bcas(sharpness: Float)
     /// Nearest neighbour (integer scaling at integer ratios). Not from the DLL.
     case nearest
+    /// NVIDIA Image Scaling: edge-adaptive upscale with sharpening, `sharpness` 0 … 1 (0.5: NVIDIA's default). Not
+    /// from the DLL (NVIDIA's MIT source, see NIS.swift), so it needs no Lossless Scaling.
+    case nis(sharpness: Float)
+
+    /// Whether it runs Lossless Scaling's shaders (so needs `LSSKernels` from a Lossless.dll).
+    public var needsLosslessScaling: Bool {
+        switch self {
+        case .nearest, .nis: false
+        default: true
+        }
+    }
 }
 
 /// Upscales a region of a texture into a region of another, with one of Lossless Scaling's upscalers. Create one per
@@ -26,7 +37,9 @@ public final class LSSUpscaler: @unchecked Sendable {
     /// Input is scRGB-like HDR (LS1 converts it for its network, then back).
     public var hdr = false
 
-    private let kernels: LSSKernels
+    private let kernels: LSSKernels?   // nil: only the modes that don't need Lossless Scaling
+    private let device: MTLDevice
+    private var nis: NISUpscaler?
     private var intermediates: [MTLTexture] = []
     private let nearest: MTLComputePipelineState
     private let linearClamp: MTLSamplerState
@@ -40,16 +53,21 @@ public final class LSSUpscaler: @unchecked Sendable {
     static let cas: UInt32 = 134
     static let bicubicID: UInt32 = 133
 
-    public init(kernels: LSSKernels, mode: LSSMode, inputSize: MTLSize, outputSize: MTLSize) throws {
+    /// `kernels`: Lossless Scaling's (nil is enough for `.nearest` and `.nis`); `device` is theirs when given.
+    public init(kernels: LSSKernels?, device: MTLDevice? = nil, mode: LSSMode, inputSize: MTLSize, outputSize: MTLSize,
+                hdr: Bool = false) throws {
         guard inputSize.width > 0, inputSize.height > 0, outputSize.width > 0, outputSize.height > 0 else {
             throw LSSError.badSize("empty input or output")
         }
+        guard let device = device ?? kernels?.device else { throw LSSError.badSize("no device") }
+        if mode.needsLosslessScaling && kernels == nil { throw LSSError.needsLosslessScaling }
         self.kernels = kernels
+        self.device = device
+        self.hdr = hdr
         self.mode = mode
         self.inputSize = inputSize
         self.outputSize = outputSize
-        let device = kernels.device
-        nearest = try device.makeComputePipelineState(function: kernels.own.makeFunction(name: "lss_nearest")!)
+        nearest = try LSSKernels.nearestPipeline(device: device)
         let sd = MTLSamplerDescriptor()
         sd.minFilter = .linear
         sd.magFilter = .linear
@@ -75,6 +93,9 @@ public final class LSSUpscaler: @unchecked Sendable {
             break
         case .nearest:
             break
+        case let .nis(sharpness):
+            nis = try NISUpscaler(device: device, inputSize: inputSize, outputSize: outputSize, sharpness: sharpness,
+                                  hdr: hdr ? .linear : .none)
         }
     }
 
@@ -102,7 +123,7 @@ public final class LSSUpscaler: @unchecked Sendable {
 
         func run(_ id: UInt32, consts: Consts?, cbName: String = "cb0", textures: [String: MTLTexture], grid: MTLSize,
                  extra: ((MTLComputeCommandEncoder, LSSKernels.Kernel) -> Void)? = nil) {
-            let k = kernels[id]
+            let k = kernels![id]
             enc.setComputePipelineState(k.pipeline)
             if var c = consts, let i = k.index(cbName) { enc.setBytes(&c, length: MemoryLayout<Consts>.stride, index: i) }
             for (name, t) in textures { if let i = k.index(name) { enc.setTexture(t, index: i) } }
@@ -139,7 +160,7 @@ public final class LSSUpscaler: @unchecked Sendable {
             var easu = Self.easuConstants(input: (Float(inputOrigin.x), Float(inputOrigin.y), Float(iw), Float(ih)),
                                           texture: (Float(input.width), Float(input.height)), output: (Float(ow), Float(oh)))
             let groups = MTLSize(width: (Int(ow) + 15) / 16, height: (Int(oh) + 15) / 16, depth: 1)
-            var k = kernels[Self.fsrEASU]
+            var k = kernels![Self.fsrEASU]
             enc.setComputePipelineState(k.pipeline)
             if let i = k.index("cb0") { enc.setBytes(&easu, length: easu.count * 4, index: i) }
             if let i = k.index("t0") { enc.setTexture(input, index: i) }
@@ -151,7 +172,7 @@ public final class LSSUpscaler: @unchecked Sendable {
             var rcas = [Float](repeating: 0, count: 20)
             rcas[0] = exp2(-stops)
             var origin: [UInt32] = [UInt32(outputOrigin.x), UInt32(outputOrigin.y), 0, 0]
-            k = kernels[Self.fsrRCAS]
+            k = kernels![Self.fsrRCAS]
             enc.setComputePipelineState(k.pipeline)
             if let i = k.index("cb0") { enc.setBytes(&rcas, length: rcas.count * 4, index: i) }
             if let i = k.index("cb1") { enc.setBytes(&origin, length: origin.count * 4, index: i) }
@@ -169,7 +190,7 @@ public final class LSSUpscaler: @unchecked Sendable {
                     let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: output.pixelFormat, width: Int(ow), height: Int(oh), mipmapped: false)
                     d.usage = [.shaderRead, .shaderWrite]
                     d.storageMode = .private
-                    intermediates = [kernels.device.makeTexture(descriptor: d)!]
+                    intermediates = [device.makeTexture(descriptor: d)!]
                 }
                 run(Self.bicubicID, consts: full, cbName: "cb1", textures: ["t0": input, "u0": intermediates[0]], grid: grid)
                 var a: [UInt32] = [0, 0, ow, oh, UInt32(outputOrigin.x), UInt32(outputOrigin.y), ow, oh]
@@ -191,7 +212,7 @@ public final class LSSUpscaler: @unchecked Sendable {
             var cas: [Float] = [0, 0, 0, 0, -1 / (8 + (5 - 8) * s), 0, 0, 0]
             var out = Consts(regionW: ow, regionH: oh, textureW: ow, textureH: oh, originX: 0, originY: 0, hdr: hdrFlag,
                              outW: ow, outH: oh, outX: UInt32(outputOrigin.x), outY: UInt32(outputOrigin.y))
-            let k = kernels[Self.cas]
+            let k = kernels![Self.cas]
             enc.setComputePipelineState(k.pipeline)
             if let i = k.index("cb0") { enc.setBytes(&cas, length: cas.count * 4, index: i) }
             if let i = k.index("cb1") { enc.setBytes(&out, length: MemoryLayout<Consts>.stride, index: i) }
@@ -209,6 +230,9 @@ public final class LSSUpscaler: @unchecked Sendable {
             enc.setTexture(output, index: 1)
             enc.dispatchThreads(MTLSize(width: Int(ow), height: Int(oh), depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
+
+        case .nis:
+            nis?.encode(encoder: enc, input: input, inputOrigin: inputOrigin, output: output, outputOrigin: outputOrigin)
         }
     }
 
@@ -232,7 +256,7 @@ public final class LSSUpscaler: @unchecked Sendable {
         if zero == nil {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Float, width: 1, height: 1, mipmapped: false)
             d.usage = .shaderRead
-            zero = kernels.device.makeTexture(descriptor: d)
+            zero = device.makeTexture(descriptor: d)
             var z: UInt16 = 0
             zero?.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &z, bytesPerRow: 2)
         }
